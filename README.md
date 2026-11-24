@@ -117,6 +117,164 @@ sudo filebeat test output
 
 0 agent pour l'instant. Les alertes déjà présentes viennent du serveur lui-même : le manager se surveille aussi.
 
+## Job 03 – VM Debian, agents et règles de surveillance
+
+### Les 2 VM agents
+
+Clonées depuis ma VM modèle Debian 13 (sans interface graphique) : 1 vCPU, 1 Go de RAM, 20 Go, NAT.
+
+| VM | IP |
+|---|---|
+| debian-agent1 | 192.168.58.152 |
+| debian-agent2 | 192.168.58.164 |
+
+Sur chaque clone, je change ce qui doit être unique : le nom, le `machine-id` et les clés SSH.
+
+```bash
+sudo hostnamectl set-hostname debian-agent1
+sudo sed -i "s/debian13/$(hostname)/g" /etc/hosts
+sudo rm /etc/machine-id && sudo systemd-machine-id-setup
+sudo rm /etc/ssh/ssh_host_* && sudo dpkg-reconfigure openssh-server
+```
+
+Après ça, SSH m'a affiché `REMOTE HOST IDENTIFICATION HAS CHANGED` : normal, la clé du serveur a changé. J'ai vérifié que l'empreinte affichée était bien celle générée par la VM avant d'accepter (`ssh-keygen -R <IP>` puis reconnexion).
+
+### Installation de l'agent
+
+Même version que le manager (`4.14.10-1`), bloquée avec `apt-mark hold` pour qu'une mise à jour ne la rende pas plus récente que le serveur.
+
+```bash
+sudo apt-get update && sudo apt-get install -y gnupg curl
+curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | sudo gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import
+sudo chmod 644 /usr/share/keyrings/wazuh.gpg
+echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | sudo tee /etc/apt/sources.list.d/wazuh.list
+sudo apt-get update
+sudo WAZUH_MANAGER="192.168.58.162" WAZUH_AGENT_NAME="$(hostname)" apt-get install -y wazuh-agent=4.14.10-1
+sudo apt-mark hold wazuh-agent
+sudo systemctl daemon-reload && sudo systemctl enable --now wazuh-agent
+```
+
+Les 2 agents sont connectés au serveur :
+
+![agent_control](captures/job03-agent-control.png)
+
+![debian-agent1 dans le dashboard](captures/job03-agent1-dashboard.png)
+
+### Ce qui est surveillé par défaut
+
+```bash
+sudo grep -nE "<directories|<frequency>|full_command|<alias>|syscollector|<processes>|<ports" /var/ossec/etc/ossec.conf
+which netstat ss
+```
+
+![Config par défaut](captures/job03-config-defaut.png)
+
+Constats :
+- **Fichiers** : `/etc`, `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/boot`, mais vérifiés seulement **toutes les 12 h** (`43200` s).
+- **Processus** : inventaire par syscollector, toutes les heures.
+- **Réseau** : une commande `netstat` toutes les 6 min… mais **`netstat` n'est pas installé** sur Debian 13 (seul `ss` existe). La surveillance des ports ne marchait donc pas du tout.
+
+### Ma configuration
+
+Je configure **une seule fois sur le serveur**, dans `/var/ossec/etc/shared/default/agent.conf`. Ce fichier est envoyé automatiquement à tous les agents du groupe `default`.
+
+```xml
+<agent_config>
+
+  <!-- FICHIERS : temps réel, avec le détail des modifs dans /etc -->
+  <syscheck>
+    <directories realtime="yes" check_all="yes" report_changes="yes">/etc</directories>
+    <directories realtime="yes" check_all="yes">/usr/bin,/usr/sbin,/root</directories>
+  </syscheck>
+
+  <!-- PROCESSUS : inventaire toutes les 5 min (au lieu de 1 h) -->
+  <wodle name="syscollector">
+    <interval>5m</interval>
+    <processes>yes</processes>
+    <ports all="yes">yes</ports>
+  </wodle>
+
+</agent_config>
+```
+
+Vérification : `sudo /var/ossec/bin/verify-agent-conf` → `OK`. Les agents ont bien reçu la config (`Monitoring path: '/etc' … realtime`) :
+
+![agent.conf reçu](captures/job03-agentconf-recu.png)
+
+**Pour le réseau**, j'avais aussi mis la commande `netstat` dans `agent.conf`, mais les agents l'ont refusée : `Remote commands are not accepted from the manager`. C'est une protection : si le serveur était piraté, il ne pourrait pas faire exécuter n'importe quelle commande sur tous les postes. J'ai choisi de **ne pas** lever cette protection. À la place, sur chaque agent :
+
+```bash
+sudo apt-get install -y net-tools      # installe netstat
+sudo sed -i '/<alias>netstat listening ports<\/alias>/{n;s/<frequency>360</<frequency>60</}' /var/ossec/etc/ossec.conf
+sudo systemctl restart wazuh-agent
+```
+
+La règle Wazuh **533** compare la sortie de cette commande d'une fois sur l'autre et alerte dès qu'un port s'ouvre ou se ferme.
+
+### Tests
+
+Sur debian-agent1 :
+
+```bash
+echo "parametre=1" | sudo tee /etc/test-edr.conf     # création
+sleep 5; echo "parametre=2" | sudo tee /etc/test-edr.conf   # modification
+sleep 5; sudo rm /etc/test-edr.conf                  # suppression
+nc -lk 4444 &                                        # ouverture d'un port (comme une backdoor)
+```
+
+![Tests sur l'agent](captures/job03-tests-agent1.png)
+
+Résultat côté serveur :
+
+| Test | Règle | Description |
+|---|---|---|
+| Création du fichier | 554 | File added to the system |
+| Modification | 550 | Integrity checksum changed |
+| Suppression | 553 | File deleted |
+| Port 4444 ouvert | 533 | Listened ports status (netstat) changed |
+
+![Alertes](captures/job03-alertes-cli.png)
+
+Détail de l'alerte 550 : mode `realtime`, et les empreintes (md5, sha1, sha256) ont changé.
+
+![Détail 550](captures/job03-detail-550.png)
+
+`report_changes` devait aussi afficher le contenu modifié (`parametre=1` → `parametre=2`), mais l'alerte ne le montre pas. Je n'ai pas trouvé pourquoi : la modification est quand même prouvée par les empreintes et la date.
+
+Dans le dashboard, les 3 événements sur le fichier (File Integrity Monitoring) :
+
+![FIM](captures/job03-fim.png)
+
+L'alerte réseau (Threat Hunting, `rule.id:533`) :
+
+![Alerte 533](captures/job03-alerte-533.png)
+
+Le détail des 2 alertes 533 : Wazuh compare la liste des ports avec la précédente.
+
+- 09:06:48 UTC : la ligne `tcp 0.0.0.0:4444 … 19665/nc` **apparaît** → port ouvert
+
+![533 ouverture](captures/job03-533-ouvert.png)
+
+- 09:18:49 UTC, après `kill %1` : la ligne **disparaît** → port fermé
+
+![533 fermeture](captures/job03-533-ferme.png)
+
+Le processus `nc` dans l'inventaire (IT Hygiene → Processes). Le PID `19665` est bien celui affiché par le shell au lancement :
+
+![Processus nc](captures/job03-processus-nc.png)
+
+**Constat sur le serveur :** j'ai eu 4 alertes « File deleted » sur des fichiers de `/etc/wazuh-indexer/backup/`, datées de 08:23:22 UTC, alors que je n'avais rien fait à ce moment-là. Explication trouvée dans les logs :
+- à 08:23:22, le serveur termine son contrôle FIM programmé (`File integrity monitoring scan ended`). Sur le serveur, le FIM n'est **pas** en temps réel : un contrôle toutes les 12 h ;
+- seul l'outil `wazuh-passwords-tool.sh` utilise ce dossier : il y fait des sauvegardes puis les supprime. Je l'avais lancé la veille.
+
+L'heure d'une alerte FIM sans temps réel, c'est donc l'heure où Wazuh **remarque** le changement, pas l'heure du changement. C'est pour ça que j'ai mis `realtime` sur les agents.
+
+![FIM du serveur](captures/job03-fim-serveur.png)
+
+Autre détail : chaque commande `sudo` est elle-même enregistrée et remonte en alerte dans Wazuh. Mes `sudo grep` sur les alertes apparaissaient donc dans les résultats.
+
+**Limite :** pour les processus, Wazuh fait un **inventaire** (toutes les 5 min), pas une alerte. Un processus lancé puis arrêté entre deux inventaires ne sera pas vu. Une règle d'alerte sur un processus précis sera le sujet du Job 05.
+
 ## Problèmes rencontrés
 
 ### 1. Mauvaise version d'Ubuntu
@@ -164,3 +322,8 @@ sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
 
 Le PC s'est mis en veille pendant l'installation. Au réveil, VMware a affiché « Erreur irrécupérable (svga) », et la VM ne voulait plus redémarrer (« toutes les instances des canaux de communication sont occupées »), sans doute parce que l'ancien processus de la VM tournait encore.
 → J'ai désactivé l'accélération 3D de la VM et la mise en veille du PC sur secteur (`powercfg /change standby-timeout-ac 0`).
+
+### 5. Installation de l'agent ratée sur les clones (paquets introuvables)
+
+Première tentative : `apt-get install gnupg curl` → `404 Not Found`. La liste des paquets de ma VM modèle était trop vieille (`apt` indiquait « Version de 13.6 à 13.8 ») : elle demandait des versions qui n'existent plus sur le serveur Debian. Donc pas de `curl` ni de `gpg`, donc pas de clé Wazuh, donc dépôt Wazuh refusé (« n'est pas signé »), donc pas d'agent.
+→ Il faut toujours faire `apt-get update` en premier sur une VM clonée. J'ai aussi dû supprimer le fichier `wazuh.list` créé sans clé, sinon `apt-get update` restait en erreur.
