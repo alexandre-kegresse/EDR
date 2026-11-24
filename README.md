@@ -275,6 +275,96 @@ Autre détail : chaque commande `sudo` est elle-même enregistrée et remonte en
 
 **Limite :** pour les processus, Wazuh fait un **inventaire** (toutes les 5 min), pas une alerte. Un processus lancé puis arrêté entre deux inventaires ne sera pas vu. Une règle d'alerte sur un processus précis sera le sujet du Job 05.
 
+## Job 04 – Attaque simulée et rapport d'incident
+
+### Le scénario
+
+Je simule un intrus qui :
+1. essaie de deviner le mot de passe SSH de `debian-agent1` (plusieurs mauvais mots de passe) ;
+2. finit par se connecter ;
+3. crée un compte `support` et l'ajoute au groupe `sudo` (pour garder un accès administrateur).
+
+Attaquant : `debian-agent2` (192.168.58.164). Victime : `debian-agent1` (192.168.58.152).
+
+Les tentatives sont faites à la main (`ssh x@192.168.58.152` + mauvais mot de passe, 3 essais par connexion).
+
+![Échecs depuis agent2](captures/job04-echecs-agent2.png)
+
+Actions de l'intrus une fois connecté :
+
+```bash
+sudo adduser support
+sudo usermod -aG sudo support
+```
+
+![Création du compte](captures/job04-adduser.png)
+
+**Erreur de ma part :** mon premier essai est parti de mon PC (PowerShell) et pas d'agent2. Wazuh l'a vu avec l'IP `192.168.58.1` (mon PC sur le réseau NAT VMware). J'ai refait les échecs depuis agent2 : Wazuh distingue bien les deux sources.
+
+### Ce que Wazuh a détecté
+
+Vue d'ensemble dans le dashboard (agent1, 15 dernières minutes) :
+
+![Dashboard](captures/job04-dashboard.png)
+
+Toutes les règles déclenchées sur agent1 (sans l'audit CIS, qui n'a rien à voir avec l'attaque) :
+
+```bash
+sudo grep -A1 "debian-agent1" /var/ossec/logs/alerts/alerts.log | grep "^Rule:" | grep -vE "Rule: 190(0[0-9])" | sort | uniq -c | sort -rn
+```
+
+![Règles déclenchées](captures/job04-regles-agent1.png)
+
+| Étape de l'attaque | Règles Wazuh |
+|---|---|
+| Mauvais mots de passe | 5760 `sshd: authentication failed`, 5557 `Password check failed`, 5503 `User login failed` |
+| Plusieurs échecs d'affilée | **2502** (niveau 10) `User missed the password more than one time` |
+| Connexion réussie | 5715 `sshd: authentication success` |
+| Création du compte | **5902** `New user added`, 5901 `New group added`, 5555 `User changed password` |
+| Ajout au groupe sudo | **5904** `Information from the user was changed` |
+| Utilisation de sudo | 5402 `Successful sudo to ROOT` |
+
+L'alerte la plus grave (niveau 10) donne l'**IP de l'attaquant** :
+
+```bash
+sudo grep -B1 -A4 -E "^Rule: [0-9]+ \(level 1[0-5]\)" /var/ossec/logs/alerts/alerts.log | grep -E "^20|^Rule:|^Src IP" | tail -12
+```
+
+![Alertes niveau 10](captures/job04-niveau10.png)
+
+La surveillance des fichiers en temps réel (Job 03) a aussi vu la création du compte, via les fichiers de comptes modifiés dans `/etc` :
+
+![Fichiers de comptes](captures/job04-fichiers-comptes.png)
+
+### Chronologie (heure UTC)
+
+| Heure | Événement | Source |
+|---|---|---|
+| 12:04:29 et 12:04:45 | Échecs SSH répétés (2502) | 192.168.58.1 (mon PC, 1er essai) |
+| juste après | Connexion réussie, création de `support`, ajout à `sudo` | 192.168.58.1 |
+| 12:11:45 et 12:11:57 | Échecs SSH répétés (2502) | **192.168.58.164 (agent2)** |
+
+### Constats
+
+- Wazuh a vu **chaque étape** : les échecs, la connexion, la création du compte, l'ajout à sudo, et les fichiers modifiés.
+- Mais **rien n'a été bloqué** : Wazuh alerte, il ne réagit pas tout seul par défaut. L'intrus a pu créer son compte.
+- La règle « force brute SSH » (5763) **ne s'est pas déclenchée**. Dans sa définition, il faut **8 échecs SSH (règle 5760) en 120 secondes, depuis la même IP** (`frequency="8" timeframe="120"`, `same_source_ip`). Avec mes essais à la main (6 depuis agent2), je suis en dessous. C'est la 2502 (niveau 10) qui a remonté l'alerte la plus grave.
+
+![Règle 5763](captures/job04-regle-5763.png)
+- Au passage, Wazuh fait aussi un audit de configuration (CIS Debian 13) : score **41 %** (pas d'`auditd`, pas d'AppArmor activé…).
+
+### Mesures de réponse proposées
+
+**Tout de suite (remédiation) :**
+- supprimer le compte créé : `sudo deluser --remove-home support` ;
+- changer le mot de passe du compte `x` ;
+- bloquer l'IP de l'attaquant (192.168.58.164) → automatisé au Job 06.
+
+**Pour éviter que ça recommence :**
+- SSH par **clé** uniquement (`PasswordAuthentication no`) : plus de mot de passe à deviner ;
+- bloquer automatiquement une IP après plusieurs échecs (réponse active Wazuh, Job 06) ;
+- alerte prioritaire sur toute création de compte ou ajout au groupe `sudo` (règle personnalisée, Job 05).
+
 ## Problèmes rencontrés
 
 ### 1. Mauvaise version d'Ubuntu
