@@ -320,8 +320,8 @@ sudo grep -A1 "debian-agent1" /var/ossec/logs/alerts/alerts.log | grep "^Rule:" 
 | Mauvais mots de passe | 5760 `sshd: authentication failed`, 5557 `Password check failed`, 5503 `User login failed` |
 | Plusieurs échecs d'affilée | **2502** (niveau 10) `User missed the password more than one time` |
 | Connexion réussie | 5715 `sshd: authentication success` |
-| Création du compte | **5902** `New user added`, 5901 `New group added`, 5555 `User changed password` |
-| Ajout au groupe sudo | **5904** `Information from the user was changed` |
+| Création du compte | **5902** `New user added`, 5901 `New group added`, 5555 `User changed password`, 5904 `Information from the user was changed` (fiche du compte remplie par `adduser`, via `chfn`) |
+| Ajout au groupe sudo | **aucune alerte dédiée** : seulement `/etc/group` et `/etc/gshadow` modifiés (FIM, 550) |
 | Utilisation de sudo | 5402 `Successful sudo to ROOT` |
 
 L'alerte la plus grave (niveau 10) donne l'**IP de l'attaquant** :
@@ -346,7 +346,8 @@ La surveillance des fichiers en temps réel (Job 03) a aussi vu la création du 
 
 ### Constats
 
-- Wazuh a vu **chaque étape** : les échecs, la connexion, la création du compte, l'ajout à sudo, et les fichiers modifiés.
+- Wazuh a vu les échecs, la connexion et la création du compte.
+- **L'ajout au groupe `sudo`, l'action la plus grave, n'a déclenché aucune alerte à son nom.** Il n'apparaît qu'indirectement, comme une modification de `/etc/group` (niveau 7, comme n'importe quel fichier modifié). Au départ, j'avais attribué l'alerte 5904 à cet ajout : en lisant le log brut, elle venait en fait de `chfn` (la fiche du compte remplie pendant `adduser`).
 - Mais **rien n'a été bloqué** : Wazuh alerte, il ne réagit pas tout seul par défaut. L'intrus a pu créer son compte.
 - La règle « force brute SSH » (5763) **ne s'est pas déclenchée**. Dans sa définition, il faut **8 échecs SSH (règle 5760) en 120 secondes, depuis la même IP** (`frequency="8" timeframe="120"`, `same_source_ip`). Avec mes essais à la main (6 depuis agent2), je suis en dessous. C'est la 2502 (niveau 10) qui a remonté l'alerte la plus grave.
 
@@ -364,6 +365,73 @@ La surveillance des fichiers en temps réel (Job 03) a aussi vu la création du 
 - SSH par **clé** uniquement (`PasswordAuthentication no`) : plus de mot de passe à deviner ;
 - bloquer automatiquement une IP après plusieurs échecs (réponse active Wazuh, Job 06) ;
 - alerte prioritaire sur toute création de compte ou ajout au groupe `sudo` (règle personnalisée, Job 05).
+
+## Job 05 – Règle de détection personnalisée
+
+### Le problème (vu au Job 04)
+
+L'ajout du compte de l'intrus au groupe `sudo` n'a déclenché **aucune alerte**. Pourtant l'agent a bien reçu la ligne de log :
+
+![Journal usermod](captures/job05-journal-usermod.png)
+
+Test avec `wazuh-logtest` (on lui donne une ligne de log, il dit quelle règle s'applique) : Wazuh reconnaît le programme `usermod`, mais **aucune règle** ne correspond, donc pas d'alerte.
+
+![logtest avant](captures/job05-logtest-avant.png)
+
+### Ma règle
+
+Dans `/var/ossec/etc/rules/local_rules.xml` (le fichier prévu pour les règles maison, sur le serveur) :
+
+```xml
+<!-- Job 05 : alerte critique quand un compte est ajouté au groupe sudo -->
+<group name="local,syslog,privilege_escalation,">
+  <rule id="100100" level="12">
+    <program_name>usermod</program_name>
+    <match>to group 'sudo'</match>
+    <description>Compte ajouté au groupe sudo (droits administrateur)</description>
+    <mitre>
+      <id>T1098</id>
+    </mitre>
+  </rule>
+</group>
+```
+
+- `id="100100"` : à partir de 100000 = règles personnalisées ;
+- `level="12"` : critique ;
+- la ligne doit venir de `usermod` **et** contenir `to group 'sudo'` (la 2e ligne `to shadow group 'sudo'` ne correspond pas → une seule alerte par ajout) ;
+- `T1098` : technique MITRE ATT&CK « Account Manipulation ».
+
+### Test sans toucher aux VM
+
+Même ligne dans `wazuh-logtest` : la règle 100100 se déclenche, niveau 12, classée MITRE *Persistence / Account Manipulation*.
+
+![logtest après](captures/job05-logtest-apres.png)
+
+### Test réel
+
+```bash
+# serveur : charger la règle
+sudo systemctl restart wazuh-manager
+
+# agent1 : compte de test sans mot de passe, ajouté à sudo, puis supprimé
+sudo adduser --disabled-password --comment "" test-sudo
+sudo usermod -aG sudo test-sudo
+sudo deluser --remove-home test-sudo
+```
+
+![Test sur agent1](captures/job05-test-agent1.png)
+
+L'alerte arrive sur le serveur :
+
+![Alerte 100100](captures/job05-alerte-cli.png)
+
+Et dans le dashboard (Threat Hunting, `rule.id:100100`) :
+
+![Dashboard 100100](captures/job05-dashboard.png)
+
+**À noter :** Wazuh marque l'alerte « mail » (envoi d'un email à partir du niveau 12), mais je n'ai pas configuré d'envoi d'email.
+
+**Limite :** la règle ne surveille que le groupe `sudo`. Sur d'autres systèmes, le groupe admin s'appelle `wheel` ou `admin` : il faudrait les ajouter.
 
 ## Problèmes rencontrés
 
