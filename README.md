@@ -433,6 +433,98 @@ Et dans le dashboard (Threat Hunting, `rule.id:100100`) :
 
 **Limite :** la règle ne surveille que le groupe `sudo`. Sur d'autres systèmes, le groupe admin s'appelle `wheel` ou `admin` : il faudrait les ajouter.
 
+## Job 06 – Réponse active automatisée
+
+Objectif : qu'une attaque par force brute SSH soit **bloquée automatiquement**, sans intervention humaine. Au Job 04, Wazuh voyait l'attaque mais ne faisait rien.
+
+### Quelle règle déclenche le blocage ?
+
+J'ai hésité entre deux règles vues au Job 04 :
+
+| | 5763 | 2502 |
+|---|---|---|
+| Ce qu'elle détecte | force brute **SSH** : 8 échecs en 120 s depuis la même IP | « mot de passe raté plusieurs fois » (PAM, tous services) |
+| IP source | toujours (SSH) | pas toujours (`sudo` ou `su` en local : pas d'IP à bloquer) |
+| Seuil | 8 échecs | dès 2-3 fautes de frappe sur une connexion |
+| Doc officielle Wazuh | **oui**, c'est leur exemple | non |
+
+→ **5763**. Avec la 2502, un admin qui se trompe deux fois de mot de passe serait bloqué.
+
+### Ce qu'il fallait vérifier avant
+
+Le script `firewall-drop` utilise **iptables**. Or Debian 13 utilise nftables, et iptables n'était **pas installé** sur les agents. Sans lui, le blocage aurait échoué sans aucun message.
+
+![iptables absent](captures/job06-iptables-absent.png)
+
+```bash
+sudo apt-get install -y iptables     # sur les 2 agents
+```
+
+Côté serveur, la commande `firewall-drop` existe déjà. La **liste blanche** (IP jamais bloquées) ne contenait que des adresses locales :
+
+![Config avant](captures/job06-config-avant.png)
+
+### Configuration (sur le serveur, `/var/ossec/etc/ossec.conf`)
+
+J'ajoute mon PC (`192.168.58.1`) à la liste blanche, pour ne jamais me bloquer moi-même, puis la réponse active :
+
+```xml
+<ossec_config>
+  <active-response>
+    <command>firewall-drop</command>
+    <location>local</location>
+    <rules_id>5763</rules_id>
+    <timeout>180</timeout>
+  </active-response>
+</ossec_config>
+```
+
+- `location local` : l'action s'exécute sur l'agent attaqué ;
+- `rules_id 5763` : déclenchée par la règle de force brute SSH ;
+- `timeout 180` : IP bloquée 3 minutes, puis débloquée toute seule.
+
+![Configuration](captures/job06-config.png)
+
+### Test
+
+Depuis agent2 : 3 connexions SSH avec de mauvais mots de passe. Au 8e échec, la connexion se fige. La suivante ne passe plus du tout :
+
+![Attaque bloquée](captures/job06-attaque.png)
+
+Pendant le blocage, sur agent1, iptables rejette tout ce qui vient d'agent2 :
+
+![Règle DROP](captures/job06-drop.png)
+
+Côté serveur : la règle 5763, puis la confirmation du blocage (règle 651) :
+
+![Alertes 5763 et 651](captures/job06-alertes.png)
+
+Le journal des réponses actives sur agent1 : le blocage (`Ended` à 14:07:59), puis le déblocage automatique 3 minutes plus tard (`"command":"delete"` à 14:11:00). On y voit aussi les 8 échecs qui ont déclenché la règle :
+
+![Journal active-response](captures/job06-ar-log.png)
+
+Après les 3 minutes, plus de règle dans iptables :
+
+![Déblocage](captures/job06-deblocage.png)
+
+### Chronologie (heure UTC)
+
+| Heure | Événement |
+|---|---|
+| 13:07:25 → 13:07:58 | 8 échecs SSH depuis 192.168.58.164 (en 33 secondes) |
+| 13:07:59 | Règle **5763** (niveau 10) → `firewall-drop` s'exécute sur agent1 |
+| 13:08:01 | Règle **651** « Host Blocked by firewall-drop Active Response » |
+| juste après | `ssh: connect to host … Connection timed out` depuis agent2 |
+| 13:11:00 | Déblocage automatique (`delete`), SSH remarche |
+
+### Limites
+
+- Le blocage ne dure que 3 minutes : un attaquant patient peut recommencer. En production, on mettrait un délai plus long, ou on bloquerait définitivement après plusieurs récidives.
+- `location local` : seul agent1 bloque l'attaquant. Avec `location all`, tous les agents le bloqueraient.
+- En dessous de 8 échecs en 2 minutes (mon 1er essai, avec seulement 3 échecs), rien n'est bloqué : une attaque lente passe sous le seuil.
+
+Sources : [Wazuh – Blocking SSH brute-force attack with Active Response](https://documentation.wazuh.com/current/user-manual/capabilities/active-response/ar-use-cases/blocking-ssh-brute-force.html), [Wazuh – Default active response scripts](https://documentation.wazuh.com/current/user-manual/capabilities/active-response/default-active-response-scripts.html)
+
 ## Problèmes rencontrés
 
 ### 1. Mauvaise version d'Ubuntu
