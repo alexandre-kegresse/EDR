@@ -12,6 +12,7 @@ Objectif : installer un EDR open source (Wazuh), surveiller des VM Debian, simul
 4. Job 04 – Attaque simulée et rapport
 5. Job 05 – Règle de détection personnalisée
 6. Job 06 – Réponse active automatisée
+7. Pour aller plus loin – Elastic Stack (non réalisé)
 
 ## Le labo
 
@@ -524,6 +525,24 @@ Après les 3 minutes, plus de règle dans iptables :
 - En dessous de 8 échecs en 2 minutes (mon 1er essai, avec seulement 3 échecs), rien n'est bloqué : une attaque lente passe sous le seuil.
 
 Sources : [Wazuh – Blocking SSH brute-force attack with Active Response](https://documentation.wazuh.com/current/user-manual/capabilities/active-response/ar-use-cases/blocking-ssh-brute-force.html), [Wazuh – Default active response scripts](https://documentation.wazuh.com/current/user-manual/capabilities/active-response/default-active-response-scripts.html)
+
+## Pour aller plus loin – Elastic Stack (non réalisé)
+
+Le sujet propose de montrer l'intégration de Wazuh avec un SIEM (Elastic Stack). **Je ne l'ai pas fait, par manque de temps.**
+
+J'ai quand même vérifié que c'était faisable :
+- j'ai déjà une VM ELK (runtrack précédent) avec Elasticsearch, Kibana et Logstash en **9.5.4** ;
+- avec toutes les VM allumées, il restait **4,6 Go de RAM** libres sur mon PC → assez.
+
+La méthode de la doc Wazuh passe par le plugin Logstash `logstash-input-opensearch` (lecture de l'indexer Wazuh). Ce plugin risque de ne pas marcher avec Logstash 9 (nouvelle version de Ruby). J'avais donc prévu une autre méthode :
+
+```
+wazuh-server ──(syslog_output, JSON)──> Logstash ──> Elasticsearch ──> Kibana
+```
+
+`syslog_output` est une option du manager Wazuh qui envoie les alertes en syslog, sans rien installer sur le serveur.
+
+À noter : Wazuh repose déjà sur des briques issues d'Elastic. L'indexer est OpenSearch (un fork d'Elasticsearch), le dashboard est un fork de Kibana, et c'est Filebeat (outil d'Elastic) qui envoie les alertes à l'indexer.
 
 ## Problèmes rencontrés
 
